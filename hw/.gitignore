@@ -1,0 +1,43 @@
+# Ignore build output directory
+/build
+/export
+*/hd_visual
+*/prj
+/vitis_WS
+bin/*
+
+# Ignore object files and dependent files
+.o
+.d
+
+#Ignore logs folder and log files
+/logs
+*.log
+
+#Ignore output files
+*.bin
+*.bit
+*.str
+*.txt
+*.pdi
+*.Xil
+*.jou
+*.dcp
+*.rpt
+*.mcs
+*.prm
+*.cache
+*.xsa
+*.xpr
+*.gen
+*.hw
+*.ip_user_files
+*.runs
+*.sim
+*.srcs
+*.tmpCRC
+*.dat
+*.plot
+!implementation_A0/top_static/top_A0_locked.dcp
+!bin/.gitkeep
+!CMakeLists.txt
