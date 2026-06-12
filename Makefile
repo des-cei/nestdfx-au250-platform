@@ -3,7 +3,7 @@
 ACCEL ?= timer_bram
 JOBS ?= 8
 
-all: hw
+all: hw sw
 
 hw:
 	$(MAKE) -C hw ACCEL=$(ACCEL) JOBS=$(JOBS)
