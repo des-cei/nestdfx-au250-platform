@@ -34,6 +34,14 @@ make ACCEL=<ACCEL> -j8
 
 The scripts in this folder are shared by all accelerators. In normal use, researchers should modify files inside `accelerators/<ACCEL>/`, not the common flow scripts.
 
+## Outputs
+
+After running the implementation flow for the A1 level, the following key outputs are generated inside the `A1/` output directory:
+
+*   **`A1/reports/utilization.rpt`**: The resource utilization report showing LUT, FF, BRAM, and DSP usage for the implemented design.
+*   **`A1/top_a1_locked.dcp`**: The final routed Vivado design checkpoint. You can open this file directly in Vivado to inspect the floorplan, routing, and timing paths visually.
+
+
 ## Practical rules
 
 - Keep this folder for shared flow scripts only.

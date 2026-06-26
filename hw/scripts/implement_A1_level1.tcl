@@ -17,8 +17,12 @@ opt_design
 place_design
 route_design
 
+# Generate utilization report
+report_utilization -file $loc/reports/utilization.rpt
+
 # Save checkpoint
 write_checkpoint -force $loc/top_A1_locked.dcp
+
 # Close Vivado project
 close_project
 
