@@ -10,12 +10,14 @@
  *   1. Reconfigure the A1/static reconfigurable region with a .bin file.
  *   2. Access AXI-Lite registers through the XDMA user BAR.
  *   3. Move bulk data through XDMA H2C/C2H over the full AXI bus.
+ *   4. Sample selected power rails through the Alveo CMS AXI-Lite register window.
  *
  * The public API deliberately exposes only the operations a normal user of the
  * template needs.  Device names and address-map constants are kept below so a
  * developer can adapt the file to a different Alveo shell or Vivado design.
  */
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -65,6 +67,44 @@
 #define ALVEO_DFX_SHUTDOWN_2_ADDR    0x40003000ULL
 
 /*
+ * Alveo CMS control/sensor register window.
+ */
+#define ALVEO_CMS_CTRL_ADDR     0x41000000ULL
+#define ALVEO_CMS_CTRL_MAP_SIZE 0x40000U
+
+/* CMS internal byte offsets inside ALVEO_CMS_CTRL_ADDR. */
+#define ALVEO_CMS_RESET_BYTE_OFFSET  0x20000U
+#define ALVEO_CMS_SENSOR_BYTE_OFFSET 0x28000U
+
+/* CMS sensor register word offsets from ALVEO_CMS_SENSOR_BYTE_OFFSET. */
+#define ALVEO_CMS_12V_PEX_VOLTAGE_WORD_OFFSET    10U
+#define ALVEO_CMS_12V_PEX_CURRENT_WORD_OFFSET    52U
+#define ALVEO_CMS_12V_AUX_VOLTAGE_WORD_OFFSET    19U
+#define ALVEO_CMS_12V_AUX_CURRENT_WORD_OFFSET    55U
+#define ALVEO_CMS_3V3_PEX_VOLTAGE_WORD_OFFSET    13U
+#define ALVEO_CMS_3V3_PEX_CURRENT_WORD_OFFSET    160U
+#define ALVEO_CMS_3V3_AUX_VOLTAGE_WORD_OFFSET    16U
+#define ALVEO_CMS_3V3_AUX_CURRENT_WORD_OFFSET    190U
+#define ALVEO_CMS_VCCINT_VOLTAGE_WORD_OFFSET     58U
+#define ALVEO_CMS_VCCINT_CURRENT_WORD_OFFSET     61U
+
+/*
+ * The CMS voltage/current registers are used as mV and mA values. Their
+ * product is therefore microwatts. The library stores power samples in mW so
+ * examples can print watts without losing too much precision.
+ */
+#define ALVEO_CMS_POWER_UW_PER_MW 1000U
+#define ALVEO_POWER_MW_PER_W 1000U
+
+/* Values used by the current CMS control register sequence. */
+#define ALVEO_CMS_RESET_START_VALUE 0x00000001U
+#define ALVEO_CMS_RESET_STOP_VALUE  0x00000000U
+
+/* Default power sampling configuration. */
+#define ALVEO_POWER_SAMPLE_PERIOD_US 120000U
+#define ALVEO_POWER_MAX_SAMPLES      4096U
+
+/*
  * HBICAP control registers are accessed through the AXI-Lite path.
  * The data stream itself is sent through the full AXI XDMA H2C reconfig path.
  */
@@ -80,6 +120,21 @@
 #define ALVEO_HBICAP_CTRL_START_VALUE    0x0000000CU
 #define ALVEO_HBICAP_STATUS_DONE_MASK    0x00000001U
 #define ALVEO_HBICAP_POLL_MAX            100000000UL
+
+/* -------------------------------------------------------------------------- */
+/* Power rails                                                                */
+/* -------------------------------------------------------------------------- */
+
+typedef enum {
+    ALVEO_POWER_RAIL_VCCINT = 0,
+    ALVEO_POWER_RAIL_12V_PEX,
+    ALVEO_POWER_RAIL_12V_AUX,
+    ALVEO_POWER_RAIL_3V3_PEX,
+    ALVEO_POWER_RAIL_3V3_AUX,
+    ALVEO_POWER_RAIL_CARD_TOTAL,
+} alveo_power_rail_t;
+
+#define ALVEO_POWER_DEFAULT_RAIL ALVEO_POWER_RAIL_VCCINT
 
 /* -------------------------------------------------------------------------- */
 /* Public API                                                                 */
@@ -123,5 +178,33 @@ int alveo_reg_read32(uint64_t axil_addr, uint32_t *value);
 ssize_t alveo_write(uint64_t hw_addr, const void *buffer, uint64_t size);
 ssize_t alveo_read(uint64_t hw_addr, void *buffer, uint64_t size);
 
+/*
+ * Start/stop CMS-based power-rail sampling.
+ *
+ * The implementation maps ALVEO_CMS_CTRL_ADDR through /dev/xdma0_user, starts a
+ * small sampling thread, and stores CMS-derived power samples in mW in an
+ * internal buffer. By default, the sampled rail is ALVEO_POWER_RAIL_VCCINT.
+ *
+ * Use alveo_power_get_*() after alveo_power_stop() to inspect the collected
+ * samples. All functions return 0 on success or a negative errno-style value on
+ * failure unless otherwise stated.
+ */
+int alveo_power_start(void);
+int alveo_power_stop(void);
+
+/* Select/read the rail used by the next power measurement. */
+int alveo_power_set_rail(alveo_power_rail_t rail);
+alveo_power_rail_t alveo_power_get_rail(void);
+const char *alveo_power_get_rail_name(alveo_power_rail_t rail);
+
+/* Number of samples collected by the most recent alveo_power_start/stop pair. */
+size_t alveo_power_get_num_samples(void);
+
+/* Pointer to the internal sample buffer. Valid until the next power start. */
+const uint32_t *alveo_power_get_samples(void);
+
+/* Simple statistics over the collected samples, in mW. Return 0 if there are none. */
+uint32_t alveo_power_get_average(void);
+uint32_t alveo_power_get_max(void);
 
 #endif /* ALVEO_H */

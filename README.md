@@ -14,9 +14,9 @@ A root Makefile is also provided to build the hardware and software sides from t
 
 ## Repository layout
 
-- [hw/](hw/README.md): hardware DFX shell, static A0 shell, A1 reconfigurable module flow, accelerator examples and Vivado/TCL build scripts.
-- [sw/](sw/README.md): C userspace runtime for XDMA, AXI-Lite and HBICAP, plus software examples matching the hardware accelerators.
-- [Makefile](Makefile): top-level helper Makefile that delegates to `hw/` and `sw/`.
+- [`hw/`](hw/README.md): hardware DFX shell, static A0 shell, A1 reconfigurable module flow, accelerator examples and Vivado/TCL build scripts.
+- [`sw/`](sw/README.md): C userspace runtime for XDMA, AXI-Lite, HBICAP and optional CMS power sampling, plus software examples matching the hardware accelerators.
+- [`Makefile`](Makefile): top-level helper Makefile that delegates to `hw/` and `sw/`.
 
 ## Basic idea
 
@@ -26,7 +26,8 @@ The software side provides a small userspace runtime to:
 
 - load A1 partial bitstreams through HBICAP,
 - access AXI-Lite registers through XDMA,
-- move data through full-AXI XDMA transfers.
+- move data through full-AXI XDMA transfers,
+- optionally collect Alveo CMS power samples around a workload section.
 
 The recommended convention is to use the same accelerator name on both sides.
 
@@ -48,7 +49,7 @@ Run the software with the generated A1 partial bitstream:
 
 ```bash
 cd sw
-sudo ./timer_bram <a1_region_bitstream.bin>
+sudo ./timer_bram path/to/top_A1_reconfig.bin
 ```
 
 For another accelerator, use the same name:
@@ -96,11 +97,11 @@ Both approaches are equivalent. The root Makefile is only a convenience wrapper.
 ## Useful top-level targets
 
 ```bash
-make hw ACCEL=<name>      # Build hardware for the selected accelerator
-make sw ACCEL=<name>      # Build matching software example
-make clean                # Clean hardware and software outputs
-make hw_clean             # Clean only hardware outputs
-make sw_clean             # Clean only software outputs
+make hw ACCEL=<name>     # Build hardware for the selected accelerator
+make sw ACCEL=<name>     # Build matching software example
+make clean               # Clean hardware and software outputs
+make hw_clean            # Clean only hardware outputs
+make sw_clean            # Clean only software outputs
 ```
 
 ## Documentation
@@ -112,4 +113,4 @@ For detailed instructions, see the README files inside each folder:
 
 The hardware README explains the DFX shell, accelerator structure, project generation and hardware contract.
 
-The software README explains the userspace API, XDMA/HBICAP access paths, software examples and how to adapt the runtime to a new accelerator.
+The software README explains the userspace API, XDMA/HBICAP/CMS access paths, software examples and how to adapt the runtime to a new accelerator.

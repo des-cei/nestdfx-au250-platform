@@ -4,11 +4,13 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -202,6 +204,387 @@ ssize_t alveo_read(uint64_t hw_addr, void *buffer, uint64_t size)
 {
     return xdma_transfer(ALVEO_XDMA_C2H_DATA_DEV, 0, hw_addr, buffer, size);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Alveo CMS power sampling */
+/* -------------------------------------------------------------------------- */
+
+static int power_fd = -1;
+static void *power_cms_map = MAP_FAILED;
+static pthread_t power_thread;
+static int power_thread_created = 0;
+static int power_stop_requested = 0;
+static uint32_t power_samples[ALVEO_POWER_MAX_SAMPLES];
+static size_t power_num_samples = 0;
+static alveo_power_rail_t power_rail = ALVEO_POWER_DEFAULT_RAIL;
+static pthread_mutex_t power_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t power_cond = PTHREAD_COND_INITIALIZER;
+
+static volatile uint32_t *cms_word_ptr(uint32_t byte_offset)
+{
+    return (volatile uint32_t *)(void *)((unsigned char *)power_cms_map + byte_offset);
+}
+
+static int map_cms_control(void)
+{
+    if (power_cms_map != MAP_FAILED)
+        return 0;
+
+    power_fd = open(ALVEO_XDMA_USER_DEV, O_RDWR | O_SYNC);
+    if (power_fd < 0)
+        return report_errno("open(" ALVEO_XDMA_USER_DEV ")");
+
+    const uint64_t cms_user_offset = ALVEO_AXIL_USER_OFFSET(ALVEO_CMS_CTRL_ADDR);
+
+    power_cms_map = mmap(NULL,
+                         ALVEO_CMS_CTRL_MAP_SIZE,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED,
+                         power_fd,
+                         (off_t)cms_user_offset);
+    if (power_cms_map == MAP_FAILED) {
+        int ret = report_errno("mmap(CMS control)");
+        close(power_fd);
+        power_fd = -1;
+        return ret;
+    }
+
+    return 0;
+}
+
+static void unmap_cms_control(void)
+{
+    if (power_cms_map != MAP_FAILED) {
+        (void)munmap(power_cms_map, ALVEO_CMS_CTRL_MAP_SIZE);
+        power_cms_map = MAP_FAILED;
+    }
+
+    if (power_fd >= 0) {
+        (void)close(power_fd);
+        power_fd = -1;
+    }
+}
+
+static void cms_write_reset(uint32_t value)
+{
+    volatile uint32_t *reset_reg = cms_word_ptr(ALVEO_CMS_RESET_BYTE_OFFSET);
+    *reset_reg = value;
+    __sync_synchronize();
+}
+
+static uint32_t cms_read_power_pair_mw(uint32_t voltage_word, uint32_t current_word)
+{
+    volatile uint32_t *sensor_regs = cms_word_ptr(ALVEO_CMS_SENSOR_BYTE_OFFSET);
+    const uint32_t voltage_mv = sensor_regs[voltage_word];
+    const uint32_t current_ma = sensor_regs[current_word];
+
+    /*
+     * The CMS registers are interpreted as mV and mA. Their product is uW.
+     * Keep the public sample buffer in mW so applications can print W with a
+     * decimal conversion while still using compact integer samples internally.
+     */
+    const uint64_t sample_uw = (uint64_t)voltage_mv * (uint64_t)current_ma;
+    const uint64_t sample_mw = sample_uw / ALVEO_CMS_POWER_UW_PER_MW;
+
+    if (sample_mw > UINT32_MAX)
+        return UINT32_MAX;
+
+    return (uint32_t)sample_mw;
+}
+
+static uint32_t cms_read_power_sample(alveo_power_rail_t rail)
+{
+    uint64_t total_mw;
+
+    switch (rail) {
+    case ALVEO_POWER_RAIL_VCCINT:
+        return cms_read_power_pair_mw(ALVEO_CMS_VCCINT_VOLTAGE_WORD_OFFSET,
+                                      ALVEO_CMS_VCCINT_CURRENT_WORD_OFFSET);
+
+    case ALVEO_POWER_RAIL_12V_PEX:
+        return cms_read_power_pair_mw(ALVEO_CMS_12V_PEX_VOLTAGE_WORD_OFFSET,
+                                      ALVEO_CMS_12V_PEX_CURRENT_WORD_OFFSET);
+
+    case ALVEO_POWER_RAIL_12V_AUX:
+        return cms_read_power_pair_mw(ALVEO_CMS_12V_AUX_VOLTAGE_WORD_OFFSET,
+                                      ALVEO_CMS_12V_AUX_CURRENT_WORD_OFFSET);
+
+    case ALVEO_POWER_RAIL_3V3_PEX:
+        return cms_read_power_pair_mw(ALVEO_CMS_3V3_PEX_VOLTAGE_WORD_OFFSET,
+                                      ALVEO_CMS_3V3_PEX_CURRENT_WORD_OFFSET);
+
+    case ALVEO_POWER_RAIL_3V3_AUX:
+        return cms_read_power_pair_mw(ALVEO_CMS_3V3_AUX_VOLTAGE_WORD_OFFSET,
+                                      ALVEO_CMS_3V3_AUX_CURRENT_WORD_OFFSET);
+
+    case ALVEO_POWER_RAIL_CARD_TOTAL:
+        total_mw = 0;
+        total_mw += cms_read_power_pair_mw(ALVEO_CMS_12V_PEX_VOLTAGE_WORD_OFFSET,
+                                           ALVEO_CMS_12V_PEX_CURRENT_WORD_OFFSET);
+        total_mw += cms_read_power_pair_mw(ALVEO_CMS_12V_AUX_VOLTAGE_WORD_OFFSET,
+                                           ALVEO_CMS_12V_AUX_CURRENT_WORD_OFFSET);
+        total_mw += cms_read_power_pair_mw(ALVEO_CMS_3V3_PEX_VOLTAGE_WORD_OFFSET,
+                                           ALVEO_CMS_3V3_PEX_CURRENT_WORD_OFFSET);
+        total_mw += cms_read_power_pair_mw(ALVEO_CMS_3V3_AUX_VOLTAGE_WORD_OFFSET,
+                                           ALVEO_CMS_3V3_AUX_CURRENT_WORD_OFFSET);
+
+        if (total_mw > UINT32_MAX)
+            return UINT32_MAX;
+
+        return (uint32_t)total_mw;
+    }
+
+    return 0;
+}
+
+static int power_wait_sample_period(void)
+{
+    struct timespec timeout;
+
+    if (clock_gettime(CLOCK_REALTIME, &timeout) != 0)
+        return 0;
+
+    timeout.tv_sec += ALVEO_POWER_SAMPLE_PERIOD_US / 1000000U;
+    timeout.tv_nsec += (long)(ALVEO_POWER_SAMPLE_PERIOD_US % 1000000U) * 1000L;
+    if (timeout.tv_nsec >= 1000000000L) {
+        timeout.tv_sec += 1;
+        timeout.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&power_lock);
+    while (!power_stop_requested) {
+        int rc = pthread_cond_timedwait(&power_cond, &power_lock, &timeout);
+        if (rc == ETIMEDOUT)
+            break;
+        if (rc != 0)
+            break;
+    }
+
+    int stop = power_stop_requested || power_num_samples >= ALVEO_POWER_MAX_SAMPLES;
+    pthread_mutex_unlock(&power_lock);
+
+    return stop;
+}
+
+static void *power_sample_thread(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&power_lock);
+        int stop = power_stop_requested || power_num_samples >= ALVEO_POWER_MAX_SAMPLES;
+        pthread_mutex_unlock(&power_lock);
+
+        if (stop)
+            break;
+
+        alveo_power_rail_t rail;
+
+        pthread_mutex_lock(&power_lock);
+        rail = power_rail;
+        pthread_mutex_unlock(&power_lock);
+
+        uint32_t sample = cms_read_power_sample(rail);
+
+        pthread_mutex_lock(&power_lock);
+        if (!power_stop_requested && power_num_samples < ALVEO_POWER_MAX_SAMPLES)
+            power_samples[power_num_samples++] = sample;
+        stop = power_stop_requested || power_num_samples >= ALVEO_POWER_MAX_SAMPLES;
+        pthread_mutex_unlock(&power_lock);
+
+        if (stop)
+            break;
+
+        if (power_wait_sample_period())
+            break;
+    }
+
+    return NULL;
+}
+
+int alveo_power_start(void)
+{
+    int ret;
+
+    pthread_mutex_lock(&power_lock);
+    if (power_thread_created) {
+        pthread_mutex_unlock(&power_lock);
+        fprintf(stderr, "[alveo] power monitor is already running\n");
+        return -EBUSY;
+    }
+
+    memset(power_samples, 0, sizeof(power_samples));
+    power_num_samples = 0;
+    power_stop_requested = 0;
+    pthread_mutex_unlock(&power_lock);
+
+    ret = map_cms_control();
+    if (ret < 0)
+        return ret;
+
+    cms_write_reset(ALVEO_CMS_RESET_START_VALUE);
+
+    ret = pthread_create(&power_thread, NULL, power_sample_thread, NULL);
+    if (ret != 0) {
+        errno = ret;
+        ret = report_errno("pthread_create(power monitor)");
+        cms_write_reset(ALVEO_CMS_RESET_STOP_VALUE);
+        unmap_cms_control();
+        return ret;
+    }
+
+    pthread_mutex_lock(&power_lock);
+    power_thread_created = 1;
+    pthread_mutex_unlock(&power_lock);
+
+    return 0;
+}
+
+int alveo_power_stop(void)
+{
+    int ret = 0;
+    int should_join;
+
+    pthread_mutex_lock(&power_lock);
+    should_join = power_thread_created;
+    power_stop_requested = 1;
+    pthread_cond_signal(&power_cond);
+    pthread_mutex_unlock(&power_lock);
+
+    if (should_join) {
+        int rc = pthread_join(power_thread, NULL);
+        if (rc != 0) {
+            errno = rc;
+            ret = report_errno("pthread_join(power monitor)");
+        }
+
+        pthread_mutex_lock(&power_lock);
+        power_thread_created = 0;
+        pthread_mutex_unlock(&power_lock);
+    }
+
+    if (power_cms_map != MAP_FAILED)
+        cms_write_reset(ALVEO_CMS_RESET_STOP_VALUE);
+
+    unmap_cms_control();
+
+    return ret;
+}
+
+static int power_rail_is_valid(alveo_power_rail_t rail)
+{
+    switch (rail) {
+    case ALVEO_POWER_RAIL_VCCINT:
+    case ALVEO_POWER_RAIL_12V_PEX:
+    case ALVEO_POWER_RAIL_12V_AUX:
+    case ALVEO_POWER_RAIL_3V3_PEX:
+    case ALVEO_POWER_RAIL_3V3_AUX:
+    case ALVEO_POWER_RAIL_CARD_TOTAL:
+        return 1;
+    }
+
+    return 0;
+}
+
+int alveo_power_set_rail(alveo_power_rail_t rail)
+{
+    if (!power_rail_is_valid(rail))
+        return -EINVAL;
+
+    pthread_mutex_lock(&power_lock);
+    if (power_thread_created) {
+        pthread_mutex_unlock(&power_lock);
+        fprintf(stderr, "[alveo] cannot change power rail while monitoring is running\n");
+        return -EBUSY;
+    }
+
+    power_rail = rail;
+    pthread_mutex_unlock(&power_lock);
+
+    return 0;
+}
+
+alveo_power_rail_t alveo_power_get_rail(void)
+{
+    alveo_power_rail_t rail;
+
+    pthread_mutex_lock(&power_lock);
+    rail = power_rail;
+    pthread_mutex_unlock(&power_lock);
+
+    return rail;
+}
+
+const char *alveo_power_get_rail_name(alveo_power_rail_t rail)
+{
+    switch (rail) {
+    case ALVEO_POWER_RAIL_VCCINT:
+        return "VCCINT";
+    case ALVEO_POWER_RAIL_12V_PEX:
+        return "12V_PEX";
+    case ALVEO_POWER_RAIL_12V_AUX:
+        return "12V_AUX";
+    case ALVEO_POWER_RAIL_3V3_PEX:
+        return "3V3_PEX";
+    case ALVEO_POWER_RAIL_3V3_AUX:
+        return "3V3_AUX";
+    case ALVEO_POWER_RAIL_CARD_TOTAL:
+        return "CARD_TOTAL";
+    }
+
+    return "UNKNOWN";
+}
+
+size_t alveo_power_get_num_samples(void)
+{
+    size_t count;
+
+    pthread_mutex_lock(&power_lock);
+    count = power_num_samples;
+    pthread_mutex_unlock(&power_lock);
+
+    return count;
+}
+
+const uint32_t *alveo_power_get_samples(void)
+{
+    return power_samples;
+}
+
+uint32_t alveo_power_get_average(void)
+{
+    uint64_t sum = 0;
+    size_t count;
+
+    pthread_mutex_lock(&power_lock);
+    count = power_num_samples;
+    for (size_t i = 0; i < count; ++i)
+        sum += power_samples[i];
+    pthread_mutex_unlock(&power_lock);
+
+    if (count == 0)
+        return 0;
+
+    return (uint32_t)(sum / count);
+}
+
+uint32_t alveo_power_get_max(void)
+{
+    uint32_t max = 0;
+
+    pthread_mutex_lock(&power_lock);
+    for (size_t i = 0; i < power_num_samples; ++i) {
+        if (power_samples[i] > max)
+            max = power_samples[i];
+    }
+    pthread_mutex_unlock(&power_lock);
+
+    return max;
+}
+
+/* -------------------------------------------------------------------------- */
+/* HBICAP reconfiguration */
+/* -------------------------------------------------------------------------- */
 
 static int load_binary_file(const char *path, unsigned char **data, size_t *size)
 {

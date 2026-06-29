@@ -32,6 +32,7 @@
  *   2. Move input/output buffers through XDMA using alveo_write()/alveo_read().
  *   3. Program and start the HLS IP through AXI-Lite registers.
  *   4. Poll ap_done and verify the scaled output buffer.
+ *   5. Measure a CMS power rail during accelerator execution through alveo_power_start/stop().
  *
  * To adapt this file to another HLS design, modify mainly:
  *
@@ -234,6 +235,26 @@ static int parse_u32_arg(const char *text, uint32_t *value)
     return 0;
 }
 
+static void print_power_summary(void)
+{
+    size_t nsamples = alveo_power_get_num_samples();
+
+    printf(" Power rail    : %s\n",
+           alveo_power_get_rail_name(alveo_power_get_rail()));
+    printf(" Power samples : %zu\n", nsamples);
+
+    if (nsamples == 0) {
+        printf(" Average power : n/a\n");
+        printf(" Maximum power : n/a\n");
+        return;
+    }
+
+    printf(" Average power : %.3f W\n",
+           (double)alveo_power_get_average() / (double)ALVEO_POWER_MW_PER_W);
+    printf(" Maximum power : %.3f W\n",
+           (double)alveo_power_get_max() / (double)ALVEO_POWER_MW_PER_W);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Main tutorial flow                                                         */
 /* -------------------------------------------------------------------------- */
@@ -246,6 +267,7 @@ int main(int argc, char **argv)
     size_t transfer_size;
     uint32_t *input_buffer = NULL;
     uint32_t *output_buffer = NULL;
+    int power_started = 0;
     int status = EXIT_FAILURE;
 
     if (argc < 2 || argc > 4) {
@@ -291,7 +313,7 @@ int main(int argc, char **argv)
     }
 
     /* ------------------------------------------------------------------ */
-    /* 2. Allocate host buffers and prepare the input pattern.             */
+    /* 2. Allocate host buffers and prepare the input pattern.            */
     /* ------------------------------------------------------------------ */
 
     printf("[2] Allocating DMA buffers...\n");
@@ -309,7 +331,7 @@ int main(int argc, char **argv)
     memset(output_buffer, 0, transfer_size);
 
     /* ------------------------------------------------------------------ */
-    /* 3. Initialize input/output DDR memory through XDMA.                 */
+    /* 3. Initialize input/output DDR memory through XDMA.                */
     /* ------------------------------------------------------------------ */
 
     printf("[3] Writing input buffer to DDR through XDMA...\n");
@@ -327,7 +349,7 @@ int main(int argc, char **argv)
     }
 
     /* ------------------------------------------------------------------ */
-    /* 4. Configure and start the HLS accelerator through AXI-Lite.        */
+    /* 4. Configure and start the HLS accelerator through AXI-Lite.       */
     /* ------------------------------------------------------------------ */
 
     printf("[5] Configuring ddr_scale_accel through AXI-Lite...\n");
@@ -336,7 +358,14 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    printf("[6] Starting ddr_scale_accel...\n");
+    printf("[6] Starting CMS power monitoring...\n");
+    if (alveo_power_start() < 0) {
+        printf("ERROR: could not start CMS power monitoring.\n");
+        goto cleanup;
+    }
+    power_started = 1;
+
+    printf("[7] Starting ddr_scale_accel...\n");
     if (hls_start() < 0) {
         printf("ERROR: could not start ddr_scale_accel.\n");
         goto cleanup;
@@ -347,11 +376,17 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    if (alveo_power_stop() < 0) {
+        printf("ERROR: could not stop CMS power monitoring.\n");
+        goto cleanup;
+    }
+    power_started = 0;
+
     /* ------------------------------------------------------------------ */
-    /* 5. Read the output DDR buffer back through XDMA.                    */
+    /* 5. Read the output DDR buffer back through XDMA.                   */
     /* ------------------------------------------------------------------ */
 
-    printf("[7] Reading output buffer from DDR through XDMA...\n");
+    printf("[8] Reading output buffer from DDR through XDMA...\n");
     memset(output_buffer, 0, transfer_size);
 
     if (alveo_read(OUTPUT_DDR_ADDR, output_buffer, transfer_size) !=
@@ -361,10 +396,10 @@ int main(int argc, char **argv)
     }
 
     /* ------------------------------------------------------------------ */
-    /* 6. Verify the scaled output.                                        */
+    /* 6. Verify the scaled output.                                       */
     /* ------------------------------------------------------------------ */
 
-    printf("[8] Verifying scaled output...\n");
+    printf("[9] Verifying scaled output...\n");
     if (verify_scaled_output(input_buffer, output_buffer, test_words, scale) < 0)
         goto cleanup;
 
@@ -372,10 +407,15 @@ int main(int argc, char **argv)
     printf("  Reconfiguration path works: A1 bitstream loaded.\n");
     printf("  AXI-Lite path works: HLS control registers programmed and ap_done seen.\n");
     printf("  Full AXI path works: DDR input/output buffers matched expected scaling.\n");
+    printf("  CMS power path works: power-rail samples were collected.\n");
+    print_power_summary();
 
     status = EXIT_SUCCESS;
 
 cleanup:
+    if (power_started)
+        (void)alveo_power_stop();
+
     free(output_buffer);
 cleanup_input:
     free(input_buffer);

@@ -21,6 +21,7 @@
  *   1. Reconfigure the A1 region from a .bin bitstream.
  *   2. Access AXI-Lite registers using alveo_reg_read32/write32().
  *   3. Transfer data using alveo_write()/alveo_read().
+ *   4. Measure a CMS power rail around the DMA workload using alveo_power_start/stop().
  *
  * To adapt this file to another reconfigurable design, modify mainly the
  * address definitions in the "User design configuration" section.
@@ -186,6 +187,26 @@ static int verify_test_pattern(const uint32_t *expected, const uint32_t *observe
     return 0;
 }
 
+static void print_power_summary(void)
+{
+    size_t nsamples = alveo_power_get_num_samples();
+
+    printf(" Power rail    : %s\n",
+           alveo_power_get_rail_name(alveo_power_get_rail()));
+    printf(" Power samples : %zu\n", nsamples);
+
+    if (nsamples == 0) {
+        printf(" Average power : n/a\n");
+        printf(" Maximum power : n/a\n");
+        return;
+    }
+
+    printf(" Average power : %.3f W\n",
+           (double)alveo_power_get_average() / (double)ALVEO_POWER_MW_PER_W);
+    printf(" Maximum power : %.3f W\n",
+           (double)alveo_power_get_max() / (double)ALVEO_POWER_MW_PER_W);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Main tutorial flow                                                         */
 /* -------------------------------------------------------------------------- */
@@ -200,7 +221,7 @@ int main(int argc, char **argv)
 
     uint64_t timer_before = 0;
     uint64_t timer_after = 0;
-
+    int power_started = 0;
     int status = EXIT_FAILURE;
 
     if (argc != 2) {
@@ -235,28 +256,10 @@ int main(int argc, char **argv)
      */
 
     /* ------------------------------------------------------------------ */
-    /* 2. Use AXI-Lite register accesses to start and read the timer.      */
+    /* 2. Allocate host buffers and prepare the data to send.              */
     /* ------------------------------------------------------------------ */
 
-    printf("[2] Starting the AXI Timer through AXI-Lite...\n");
-
-    if (timer_start() < 0) {
-        printf("ERROR: could not configure the AXI Timer.\n");
-        goto cleanup;
-    }
-
-    if (timer_read(&timer_before) < 0) {
-        printf("ERROR: could not read the AXI Timer.\n");
-        goto cleanup;
-    }
-
-    printf("    Timer before DMA: %" PRIu64 "\n", timer_before);
-
-    /* ------------------------------------------------------------------ */
-    /* 3. Allocate host buffers and prepare the data to send.              */
-    /* ------------------------------------------------------------------ */
-
-    printf("[3] Allocating DMA buffers...\n");
+    printf("[2] Allocating DMA buffers...\n");
 
     if (allocate_dma_buffer(&tx_buffer, transfer_size) < 0) {
         printf("ERROR: could not allocate TX buffer.\n");
@@ -272,10 +275,37 @@ int main(int argc, char **argv)
     memset(rx_buffer, 0, transfer_size);
 
     /* ------------------------------------------------------------------ */
-    /* 4. Write the buffer to BRAM using XDMA H2C.                         */
+    /* 3. Start CMS power monitoring outside the timer window.             */
     /* ------------------------------------------------------------------ */
 
-    printf("[4] Writing data to BRAM through XDMA...\n");
+    printf("[3] Starting CMS power monitoring...\n");
+    if (alveo_power_start() < 0) {
+        printf("ERROR: could not start CMS power monitoring.\n");
+        goto cleanup;
+    }
+    power_started = 1;
+
+    /*
+     * Start/read the hardware timer after power monitoring has started, and
+     * read it again before stopping power monitoring.  This avoids adding the
+     * CMS thread stop latency, which can be close to one sample period, to the
+     * timer measurement.
+     */
+    printf("[4] Starting the AXI Timer through AXI-Lite...\n");
+
+    if (timer_start() < 0) {
+        printf("ERROR: could not configure the AXI Timer.\n");
+        goto cleanup;
+    }
+
+    if (timer_read(&timer_before) < 0) {
+        printf("ERROR: could not read the AXI Timer.\n");
+        goto cleanup;
+    }
+
+    printf("    Timer before DMA: %" PRIu64 "\n", timer_before);
+
+    printf("[5] Writing data to BRAM through XDMA...\n");
 
     if (alveo_write(BRAM_BASE_ADDR, tx_buffer, transfer_size) !=
         (ssize_t)transfer_size) {
@@ -283,11 +313,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* ------------------------------------------------------------------ */
-    /* 5. Read the BRAM back using XDMA C2H.                               */
-    /* ------------------------------------------------------------------ */
-
-    printf("[5] Reading data back from BRAM through XDMA...\n");
+    printf("[6] Reading data back from BRAM through XDMA...\n");
 
     if (alveo_read(BRAM_BASE_ADDR, rx_buffer, transfer_size) !=
         (ssize_t)transfer_size) {
@@ -295,25 +321,40 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    if (timer_read(&timer_after) < 0) {
+        printf("ERROR: could not read the AXI Timer after DMA.\n");
+        goto cleanup;
+    }
+
+    printf("    Timer after DMA : %" PRIu64 "\n", timer_after);
+
+    if (alveo_power_stop() < 0) {
+        printf("ERROR: could not stop CMS power monitoring.\n");
+        goto cleanup;
+    }
+    power_started = 0;
+
     /* ------------------------------------------------------------------ */
-    /* 6. Verify that the received data matches the transmitted data.      */
+    /* 4. Verify that the received data matches the transmitted data.      */
     /* ------------------------------------------------------------------ */
 
-    printf("[6] Verifying BRAM contents...\n");
+    printf("[7] Verifying BRAM contents...\n");
 
     if (verify_test_pattern(tx_buffer, rx_buffer) < 0)
         goto cleanup;
 
-    if (timer_read(&timer_after) == 0)
-        printf("    Timer after DMA : %" PRIu64 "\n", timer_after);
-
     printf("\nSuccess.\n");
     printf("  AXI-Lite path works: timer configured and read correctly.\n");
     printf("  Full AXI path works: BRAM write/readback matched.\n");
+    printf("  CMS power path works: power-rail samples were collected.\n");
+    print_power_summary();
 
     status = EXIT_SUCCESS;
 
 cleanup:
+    if (power_started)
+        (void)alveo_power_stop();
+
     free(tx_buffer);
     free(rx_buffer);
 

@@ -2,7 +2,10 @@ CC ?= gcc
 AR ?= ar
 
 CFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c11
-CPPFLAGS ?=
+CPPFLAGS ?= -D_POSIX_C_SOURCE=200809L
+
+LDFLAGS ?=
+LDLIBS ?= -pthread
 
 # Software example selected by the user.
 # It must match a file in accelerators/<ACCEL>.c
@@ -33,7 +36,7 @@ $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
 $(TARGET): $(ACCEL_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(ACCEL_OBJ) -L. -lalveo
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) -o $@ $(ACCEL_OBJ) -L. -lalveo $(LDLIBS)
 
 %.o: %.c alveo.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
